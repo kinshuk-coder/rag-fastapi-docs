@@ -1,5 +1,12 @@
+venv/
+
 .env
 
-data/raw
+data/raw/
+data/processed/
 
-venv
+__pycache__/
+
+*.pyc
+
+chroma/
