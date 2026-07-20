@@ -25,7 +25,7 @@ explanation accompanying this file).
 import os
 import re
 import chromadb
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import SentenceTransformer, CrossEncoder
 from rank_bm25 import BM25Okapi
 
 from embed import CHROMA_DB_PATH, COLLECTION_NAME, MODEL_NAME, embed_query
@@ -55,6 +55,21 @@ DEFAULT_TOP_K = 5
 # it's not sensitive enough to need tuning for a corpus this size.
 RRF_K = 60
 
+# How many chunks the RRF fusion stage hands to the cross-encoder for
+# reranking, BEFORE cutting down to the final DEFAULT_TOP_K. Wider than
+# top_k for the same reason CANDIDATE_POOL_SIZE is wider than top_k:
+# the cross-encoder needs real candidates to choose among, not just the
+# hybrid stage's already-final answer. If this equaled DEFAULT_TOP_K,
+# reranking could only ever reorder the same 5 chunks hybrid search
+# picked - it could never pull in a 6th-or-lower ranked chunk that the
+# cross-encoder judges as actually more relevant.
+RERANK_CANDIDATE_POOL_SIZE = 15
+
+# A standard, well-established cross-encoder for passage reranking -
+# small enough to run on CPU at query time without noticeable latency
+# for a candidate pool this size (15 pairs).
+RERANKER_MODEL_NAME = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+
 
 def tokenize(text: str) -> list[str]:
     """Simple whitespace/word tokenizer for BM25 - lowercased word tokens."""
@@ -63,11 +78,12 @@ def tokenize(text: str) -> list[str]:
 
 def load_retriever():
     """
-    Loads everything needed for hybrid retrieval:
+    Loads everything needed for hybrid retrieval + reranking:
     - the embedding model (for dense search)
     - the Chroma collection (for dense search)
     - a BM25 index built from the SAME chunks stored in Chroma (for
       keyword search)
+    - a cross-encoder reranker (for precision re-scoring of candidates)
 
     Building the BM25 index from collection.get() rather than re-reading
     chunks.jsonl directly keeps a single source of truth - if Chroma's
@@ -93,7 +109,9 @@ def load_retriever():
         "metadatas": metadatas,
     }
 
-    return model, collection, bm25_index
+    reranker = CrossEncoder(RERANKER_MODEL_NAME)
+
+    return model, collection, bm25_index, reranker
 
 
 def dense_search(query: str, model: SentenceTransformer, collection, top_k: int) -> list[dict]:
@@ -169,20 +187,57 @@ def reciprocal_rank_fusion(
     return results
 
 
-def retrieve(query: str, model: SentenceTransformer, collection, bm25_index: dict, top_k: int = DEFAULT_TOP_K) -> list[dict]:
+def rerank(query: str, candidates: list[dict], reranker: CrossEncoder, top_k: int) -> list[dict]:
     """
-    Public retrieval interface - same name/shape as Milestone 3's
-    retrieve(), but now backed by hybrid search. NOTE the added
-    bm25_index parameter - see the "wiring changes" note in the
-    accompanying explanation for what callers need to update.
+    Re-scores each candidate chunk against the query using a cross-
+    encoder (query and chunk text fed TOGETHER into one model, unlike
+    the bi-encoder dense search which embeds them separately). Returns
+    the top_k candidates sorted by this more precise, more expensive
+    score.
+
+    Cross-encoder scores are raw logits, not bounded like cosine
+    similarity or comparable to BM25/fused_score - they're only
+    meaningful relative to each other WITHIN this one call, not across
+    different queries or against the earlier hybrid scores.
+    """
+    if not candidates:
+        return []
+
+    pairs = [(query, c["text"]) for c in candidates]
+    scores = reranker.predict(pairs)
+
+    for candidate, score in zip(candidates, scores):
+        candidate["rerank_score"] = float(score)
+
+    reranked = sorted(candidates, key=lambda c: c["rerank_score"], reverse=True)
+    return reranked[:top_k]
+
+
+def retrieve(
+    query: str,
+    model: SentenceTransformer,
+    collection,
+    bm25_index: dict,
+    reranker: CrossEncoder,
+    top_k: int = DEFAULT_TOP_K,
+) -> list[dict]:
+    """
+    Public retrieval interface: hybrid search (dense + BM25 fused via
+    RRF) narrows the full corpus down to RERANK_CANDIDATE_POOL_SIZE
+    candidates, then the cross-encoder reranks those candidates down to
+    the final top_k. NOTE the added reranker parameter versus
+    Milestone 6's version - see the wiring-changes note for callers.
     """
     dense_results = dense_search(query, model, collection, top_k=CANDIDATE_POOL_SIZE)
     bm25_results = bm25_search(query, bm25_index, top_k=CANDIDATE_POOL_SIZE)
-    return reciprocal_rank_fusion([dense_results, bm25_results], k=RRF_K, top_k=top_k)
+    fused_candidates = reciprocal_rank_fusion(
+        [dense_results, bm25_results], k=RRF_K, top_k=RERANK_CANDIDATE_POOL_SIZE
+    )
+    return rerank(query, fused_candidates, reranker, top_k=top_k)
 
 
 if __name__ == "__main__":
-    model, collection, bm25_index = load_retriever()
+    model, collection, bm25_index, reranker = load_retriever()
 
     sample_questions = [
         "How do I add a custom exception handler?",
@@ -195,9 +250,9 @@ if __name__ == "__main__":
         print("=" * 80)
         print(f"QUERY: {question}")
         print("-" * 80)
-        results = retrieve(question, model, collection, bm25_index, top_k=3)
+        results = retrieve(question, model, collection, bm25_index, reranker, top_k=3)
         for rank, r in enumerate(results, start=1):
-            print(f"[{rank}] fused_score={r['fused_score']:.4f}  {r['header_path']}  ({r['chunk_id']})")
+            print(f"[{rank}] rerank_score={r['rerank_score']:.4f}  (fused_score={r['fused_score']:.4f})  {r['header_path']}  ({r['chunk_id']})")
             preview = r["text"][:150].replace("\n", " ")
             print(f"    {preview}...")
         print()

@@ -49,7 +49,39 @@ question into independent sub-queries (e.g. "database setup", "startup
 shutdown events", "file uploads"), retrieving separately for each, then
 merging/deduplicating results before generation.
 
-**Status:** left as a documented, out-of-scope limitation rather than
-patched. Flagged as candidate future work rather than something masked by
-loosening the eval set's expected sources to match whatever retrieval
-happened to return.
+## 3. LLM-judge faithfulness/relevance scores don't measure completeness
+
+Question q005 ("How do I declare a request body using a Pydantic model?")
+scored a perfect 5/5 on both faithfulness and relevance after Milestone 7's
+hybrid search + reranking changes. The actual generated answer was:
+
+> "You can declare a request body using a Pydantic model [3]. To declare a
+> request body, you use Pydantic models with all their power and benefits [3]."
+
+This is circular - it restates the question as an answer, with no code
+example, no mention of how the parameter is type-hinted, nothing a developer
+could actually act on. Retrieval had correctly found the right source chunk
+(`tutorial/body.md`, appearing at both rank #1 and #3); the problem was
+entirely in generation, not retrieval - yet the judge scored it perfectly.
+
+**Root cause:** the judge rubric (see `eval/run_eval.py`'s `JUDGE_SYSTEM_PROMPT`)
+only asks two questions: does the answer contradict the context
+(faithfulness), and is it on-topic (relevance). Neither axis checks whether
+the answer contains concrete, actionable detail. A vague, technically
+non-contradictory, on-topic answer can score perfectly on both dimensions
+while being close to useless.
+
+**Status:** documented, not yet fixed. Two credible next steps, not yet
+decided between:
+1. Add a third judge dimension - e.g. "completeness" - scoring whether the
+   answer includes concrete detail (code, specific parameter names, etc.)
+   appropriate to the question, not just a restated claim.
+2. Address it at the generation-prompt level (see `generation/generate.py`'s
+   `SYSTEM_PROMPT`) - e.g. explicitly instructing the model to include a
+   code example when the retrieved context contains one, rather than only
+   instructing it to cite and avoid contradicting the context.
+
+**Lesson:** an LLM-as-judge setup is only as good as its rubric. Perfect
+scores are a reason to spot-check real outputs, not a reason to stop
+looking - this is the same instinct that caught the Milestone 5 findings,
+just applied to the scoring system itself instead of the eval set.
