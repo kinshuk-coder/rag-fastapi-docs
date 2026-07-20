@@ -35,11 +35,65 @@ from dotenv import load_dotenv
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(PROJECT_ROOT, "retrieval"))
 
-from retrieve import load_retriever, retrieve  # noqa: E402
+from retrieve import load_retriever, retrieve, DEFAULT_TOP_K  # noqa: E402
+from rate_limiter import TokenRateLimiter  # noqa: E402
 
 load_dotenv(os.path.join(PROJECT_ROOT, ".env"))
 
 GROQ_MODEL = "llama-3.1-8b-instant"
+
+# A SECOND, DIFFERENT model used only for judging (eval/run_eval.py).
+# Confirmed via console.groq.com/settings/limits that Groq enforces TPM
+# limits PER MODEL, not account-wide - llama-3.1-8b-instant has 6K TPM,
+# llama-3.3-70b-versatile has 12K TPM, and they are SEPARATE budgets.
+# Using a different model for judging means generation and judging no
+# longer compete for the same 6K/minute pool - each gets its own.
+# NOTE: these limits were read off the Groq console on a specific date
+# and may change or vary by account tier - if rate-limit waits return
+# unexpectedly, re-check the console rather than trusting this comment.
+GROQ_JUDGE_MODEL = "llama-3.3-70b-versatile"
+
+# Per-model TPM budgets, sourced from the same console page. Used to
+# size each model's independent rate limiter (see get_rate_limiter()).
+MODEL_TPM_LIMITS = {
+    GROQ_MODEL: 6000,
+    GROQ_JUDGE_MODEL: 12000,
+}
+# Conservative fallback for any model used without an entry above -
+# better to under-budget (extra waiting) than over-budget (real 429s).
+DEFAULT_TPM_FALLBACK = 6000
+
+# One rate limiter PER MODEL, created lazily on first use - see
+# get_rate_limiter(). Replaces the old single shared singleton, which
+# incorrectly assumed generation and judging drew from one pool.
+_rate_limiters: dict[str, TokenRateLimiter] = {}
+
+
+def get_rate_limiter(model: str) -> TokenRateLimiter:
+    if model not in _rate_limiters:
+        tpm = MODEL_TPM_LIMITS.get(model)
+        if tpm is None:
+            print(
+                f"WARNING: no known TPM limit for model '{model}' - falling back to "
+                f"{DEFAULT_TPM_FALLBACK}. Check console.groq.com/settings/limits and "
+                f"add it to MODEL_TPM_LIMITS for accurate pacing."
+            )
+            tpm = DEFAULT_TPM_FALLBACK
+        _rate_limiters[model] = TokenRateLimiter(max_tokens_per_minute=tpm)
+    return _rate_limiters[model]
+
+
+def estimate_message_tokens(messages: list[dict], completion_buffer: int = 500) -> int:
+    """
+    Rough pre-call token estimate for the rate limiter to decide whether
+    to wait. Same word-count-based approximation used in
+    ingestion/chunk_docs.py's token_count() - doesn't need to be exact,
+    since record_usage() always overwrites with the REAL total_tokens
+    from the response afterward. completion_buffer accounts for output
+    tokens we can't know until after the call completes.
+    """
+    total_words = sum(len(m["content"].split()) for m in messages)
+    return int(total_words * 1.3) + completion_buffer
 
 SYSTEM_PROMPT = """You are a helpful assistant that answers questions about FastAPI \
 using ONLY the documentation excerpts provided to you.
@@ -85,12 +139,34 @@ Answer the question using only the context above, following the citation rules."
     ]
 
 
-def call_groq(client: Groq, messages: list[dict], model: str = GROQ_MODEL) -> str:
+def call_groq_raw(client: Groq, messages: list[dict], model: str = GROQ_MODEL, temperature: float = 0.1):
+    """
+    Makes the actual Groq call, paced by the shared rate limiter.
+    Returns the FULL response object (not just the text) so callers
+    that need response.usage - like the pre-call estimate correction
+    below - can use it. call_groq() and eval/run_eval.py's
+    judge_answer() both build on this, so every Groq call in the
+    project - generation AND judging - draws from the same tracked
+    TPM budget.
+    """
+    estimated_tokens = estimate_message_tokens(messages)
+    limiter = get_rate_limiter(model)
+    limiter.wait_if_needed(estimated_tokens)
+
     response = client.chat.completions.create(
         model=model,
         messages=messages,
-        temperature=0.1,  # low temperature - we want faithful, not creative
+        temperature=temperature,
     )
+
+    actual_tokens = response.usage.total_tokens
+    limiter.record_usage(actual_tokens)
+
+    return response
+
+
+def call_groq(client: Groq, messages: list[dict], model: str = GROQ_MODEL) -> str:
+    response = call_groq_raw(client, messages, model, temperature=0.1)
     return response.choices[0].message.content
 
 
@@ -98,15 +174,20 @@ def generate_answer(
     question: str,
     embed_model,
     collection,
+    bm25_index: dict,
     groq_client: Groq,
-    top_k: int = 5,
+    top_k: int = DEFAULT_TOP_K,
 ) -> dict:
     """
     Full pipeline: retrieve -> build prompt -> call Groq -> return
     answer plus the sources actually used, so callers (CLI, eval script)
     can display or check citations without re-deriving them.
+
+    NOTE: as of Milestone 6, retrieve() is hybrid (dense + BM25 fused
+    via RRF), so this now needs bm25_index in addition to the
+    embedding model and Chroma collection.
     """
-    retrieved_chunks = retrieve(question, embed_model, collection, top_k=top_k)
+    retrieved_chunks = retrieve(question, embed_model, collection, bm25_index, top_k=top_k)
     messages = build_prompt(question, retrieved_chunks)
     answer_text = call_groq(groq_client, messages)
 
@@ -134,7 +215,7 @@ if __name__ == "__main__":
         )
 
     groq_client = Groq(api_key=api_key)
-    embed_model, collection = load_retriever()
+    embed_model, collection, bm25_index = load_retriever()
 
     sample_questions = [
         "How do I add a custom exception handler?",
@@ -147,7 +228,7 @@ if __name__ == "__main__":
         print("=" * 80)
         print(f"Q: {question}")
         print("-" * 80)
-        result = generate_answer(question, embed_model, collection, groq_client)
+        result = generate_answer(question, embed_model, collection, bm25_index, groq_client)
         print(result["answer"])
         print("\nSources:")
         for src in result["sources"]:
