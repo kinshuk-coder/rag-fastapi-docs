@@ -33,7 +33,7 @@ import sys
 import re
 import json
 import time
-from groq import Groq
+from groq import Groq, RateLimitError
 from dotenv import load_dotenv
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -47,6 +47,13 @@ load_dotenv(os.path.join(PROJECT_ROOT, ".env"))
 
 EVAL_SET_PATH = os.path.join(PROJECT_ROOT, "eval", "eval_set.jsonl")
 RESULTS_PATH = os.path.join(PROJECT_ROOT, "eval", "eval_results.jsonl")
+
+
+def save_results(results: list[dict]) -> None:
+    """Persist after each completed question so a quota error loses no work."""
+    with open(RESULTS_PATH, "w", encoding="utf-8") as f:
+        for row in results:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 # This must match the exact refusal phrase from generation/generate.py's
 # SYSTEM_PROMPT. If you edit the refusal wording there, update this too -
@@ -149,12 +156,21 @@ JUDGE_SYSTEM_PROMPT = """You are a strict evaluator of RAG system outputs. \
 You will be given a question, the context excerpts the system had access to, \
 and the system's generated answer. Respond ONLY with a JSON object, no other \
 text, in exactly this shape:
-{"faithfulness": <1-5 integer>, "relevance": <1-5 integer>, "reasoning": "<one sentence>"}
+{"faithfulness": <1-5 integer>, "relevance": <1-5 integer>, "completeness": <1-5 integer>, "reasoning": "<one sentence>"}
 
 faithfulness: 5 = every claim in the answer is directly supported by the \
 context, 1 = the answer relies heavily on information not in the context.
 relevance: 5 = the answer directly and completely addresses the question, \
-1 = the answer is off-topic or non-responsive."""
+1 = the answer is off-topic or non-responsive.
+completeness: 5 = the answer includes concrete, actionable detail (code, \
+specific parameter/method names, exact steps) drawn from the context - NOT \
+just a restatement of the question in different words. 1 = the answer is \
+vague or circular (e.g. "you can do X using Y" with no concrete Y shown) \
+even though the context contains specific, usable detail the answer failed \
+to include. If the context genuinely has no concrete detail to give (a purely \
+conceptual question), a clear conceptual explanation can still score 5 here -
+completeness is judged against what the CONTEXT actually offers, not an \
+absolute standard of code-or-nothing."""
 
 
 def build_judge_prompt(question: str, context_text: str, answer: str) -> list[dict]:
@@ -186,6 +202,7 @@ def parse_judge_response(raw_text: str) -> dict:
         return {
             "faithfulness": int(parsed.get("faithfulness", -1)),
             "relevance": int(parsed.get("relevance", -1)),
+            "completeness": int(parsed.get("completeness", -1)),
             "reasoning": parsed.get("reasoning", ""),
             "parse_error": False,
         }
@@ -195,6 +212,7 @@ def parse_judge_response(raw_text: str) -> dict:
         return {
             "faithfulness": -1,
             "relevance": -1,
+            "completeness": -1,
             "reasoning": f"JUDGE PARSE ERROR - raw response: {raw_text[:200]}",
             "parse_error": True,
         }
@@ -208,9 +226,9 @@ def judge_answer(groq_client: Groq, question: str, retrieved_chunks: list[dict],
     # Routed through call_groq_raw (not a direct client call) so this
     # draws from the SAME shared rate limiter as generation calls in
     # generate.py - both count against one real, shared TPM budget.
-    # Deliberately a DIFFERENT model than generation (see generate.py's
-    # GROQ_JUDGE_MODEL comment) - draws from its own separate 12K TPM
-    # budget instead of competing with generation for the same 6K pool.
+    # Deliberately a different model from generation. The configured default
+    # has a separate daily budget, unlike Compound Mini which can be routed
+    # through the already-exhausted Llama 3.3 70B quota.
     response = call_groq_raw(groq_client, messages, model=GROQ_JUDGE_MODEL, temperature=0.0)
     return parse_judge_response(response.choices[0].message.content)
 
@@ -228,8 +246,10 @@ def run_eval():
 
     eval_set = load_eval_set(EVAL_SET_PATH)
     print(f"Loaded {len(eval_set)} eval questions from {EVAL_SET_PATH}")
+    print(f"Judge model: {GROQ_JUDGE_MODEL}")
 
     all_results = []
+    judge_available = True
 
     for item in eval_set:
         question = item["question"]
@@ -275,16 +295,35 @@ def run_eval():
             row["citation_check"] = citation_validity(answer, len(sources))
             row["incorrectly_refused"] = is_refusal(answer)  # false refusal is also a bug worth seeing
             t3 = time.time()
-            judge_result = judge_answer(groq_client, question, retrieved_chunks, answer)
+            if judge_available:
+                try:
+                    judge_result = judge_answer(groq_client, question, retrieved_chunks, answer)
+                except RateLimitError as exc:
+                    judge_available = False
+                    judge_result = {
+                        "faithfulness": -1,
+                        "relevance": -1,
+                        "completeness": -1,
+                        "reasoning": f"JUDGE RATE LIMITED - {exc}",
+                        "parse_error": True,
+                        "rate_limited": True,
+                    }
+                    print("judge=rate-limited; continuing without LLM judging", end="")
+            else:
+                judge_result = {
+                    "faithfulness": -1,
+                    "relevance": -1,
+                    "completeness": -1,
+                    "reasoning": "JUDGE SKIPPED - an earlier judge call hit Groq rate limits.",
+                    "parse_error": True,
+                    "rate_limited": True,
+                }
             t4 = time.time()
             row["judge"] = judge_result
             print(f"judge={t4 - t3:.2f}s")
 
         all_results.append(row)
-
-    with open(RESULTS_PATH, "w", encoding="utf-8") as f:
-        for row in all_results:
-            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        save_results(all_results)
 
     print_summary(all_results)
     print(f"\nFull results saved to {RESULTS_PATH}")
@@ -311,14 +350,16 @@ def print_summary(results: list[dict]):
         if judged:
             avg_faithfulness = sum(r["judge"]["faithfulness"] for r in judged) / len(judged)
             avg_relevance = sum(r["judge"]["relevance"] for r in judged) / len(judged)
+            avg_completeness = sum(r["judge"]["completeness"] for r in judged) / len(judged)
         else:
-            avg_faithfulness = avg_relevance = float("nan")
+            avg_faithfulness = avg_relevance = avg_completeness = float("nan")
 
         print(f"Retrieval hit-rate: {hit_rate:.0%} ({len(answerable)} questions)")
         print(f"Citation validity rate: {citation_valid_rate:.0%}")
         print(f"False refusals (should have answered but didn't): {false_refusals}")
         print(f"Avg faithfulness (LLM judge, 1-5): {avg_faithfulness:.2f}")
         print(f"Avg relevance (LLM judge, 1-5): {avg_relevance:.2f}")
+        print(f"Avg completeness (LLM judge, 1-5): {avg_completeness:.2f}")
         if len(judged) < len(answerable):
             print(f"WARNING: {len(answerable) - len(judged)} judge calls failed to parse - check eval_results.jsonl")
 

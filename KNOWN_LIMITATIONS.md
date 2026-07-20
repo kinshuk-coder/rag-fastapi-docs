@@ -71,15 +71,12 @@ the answer contains concrete, actionable detail. A vague, technically
 non-contradictory, on-topic answer can score perfectly on both dimensions
 while being close to useless.
 
-**Status:** documented, not yet fixed. Two credible next steps, not yet
-decided between:
-1. Add a third judge dimension - e.g. "completeness" - scoring whether the
-   answer includes concrete detail (code, specific parameter names, etc.)
-   appropriate to the question, not just a restated claim.
-2. Address it at the generation-prompt level (see `generation/generate.py`'s
-   `SYSTEM_PROMPT`) - e.g. explicitly instructing the model to include a
-   code example when the retrieved context contains one, rather than only
-   instructing it to cite and avoid contradicting the context.
+**Status:** addressed in the current code, pending a fresh full evaluation
+run. The generation prompt now requires relevant concrete code, parameter, or
+method details, and the judge includes a third `completeness` dimension that
+scores answers against the actionable detail available in the retrieved
+context. This does not make a single LLM judge definitive; the original
+manual spot-check remains a necessary complement to aggregate scores.
 
 **Lesson:** an LLM-as-judge setup is only as good as its rubric. Perfect
 scores are a reason to spot-check real outputs, not a reason to stop

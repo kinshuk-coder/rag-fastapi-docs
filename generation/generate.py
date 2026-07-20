@@ -44,20 +44,38 @@ GROQ_MODEL = "llama-3.1-8b-instant"
 
 # A SECOND, DIFFERENT model used only for judging (eval/run_eval.py).
 # Confirmed via console.groq.com/settings/limits that Groq enforces TPM
-# limits PER MODEL, not account-wide - llama-3.1-8b-instant has 6K TPM,
-# llama-3.3-70b-versatile has 12K TPM, and they are SEPARATE budgets.
-# Using a different model for judging means generation and judging no
-# longer compete for the same 6K/minute pool - each gets its own.
+# limits PER MODEL, not account-wide.
+#
+# HISTORY: originally set to llama-3.3-70b-versatile (12K TPM vs
+# llama-3.1-8b-instant's 6K TPM) to give judging its own separate
+# budget. That worked for TPM, but exposed a SEPARATE constraint our
+# rate limiter didn't track at all: tokens-PER-DAY (TPD), not just
+# per-minute. llama-3.3-70b-versatile has a 100K TPD cap, which several
+# eval re-runs in one day exhausted (a real 429 mid-run). Our
+# TokenRateLimiter only models a 60-second rolling window - it has no
+# concept of a daily budget, so it couldn't see this coming.
+#
+# Do NOT use groq/compound-mini as an escape hatch for Llama 3.3's daily
+# cap. Compound Mini can route requests to Llama 3.3 70B, so its limits are
+# ultimately charged to the underlying model. That means it can still return
+# a 70B TPD error even though "compound-mini" itself shows no TPD column.
+#
+# GPT-OSS 20B has its own 200K TPD budget on the current free-tier limits and
+# is sufficient for the constrained JSON judge task. An environment variable
+# makes this easy to change without editing source (for example when using a
+# different Groq tier): GROQ_JUDGE_MODEL=openai/gpt-oss-20b.
+#
 # NOTE: these limits were read off the Groq console on a specific date
-# and may change or vary by account tier - if rate-limit waits return
-# unexpectedly, re-check the console rather than trusting this comment.
-GROQ_JUDGE_MODEL = "llama-3.3-70b-versatile"
+# and may change or vary by account tier - if rate-limit waits (or new
+# TPD errors) return unexpectedly, re-check the console rather than
+# trusting this comment.
+GROQ_JUDGE_MODEL = os.getenv("GROQ_JUDGE_MODEL", "openai/gpt-oss-20b")
 
 # Per-model TPM budgets, sourced from the same console page. Used to
 # size each model's independent rate limiter (see get_rate_limiter()).
 MODEL_TPM_LIMITS = {
     GROQ_MODEL: 6000,
-    GROQ_JUDGE_MODEL: 12000,
+    "openai/gpt-oss-20b": 8000,
 }
 # Conservative fallback for any model used without an entry above -
 # better to under-budget (extra waiting) than over-budget (real 429s).
@@ -107,7 +125,13 @@ right after the claim, like this: "FastAPI supports dependency injection [1]."
 3. If the context does not contain enough information to answer the question, \
 say "I don't have enough information in the provided documentation to answer \
 that." Do not guess or fill gaps with outside knowledge.
-4. Keep answers concise and technical - this is for a developer audience."""
+4. Keep answers concise and technical - this is for a developer audience.
+5. If any context excerpt contains a code example, parameter name, method \
+name, or other concrete technical detail relevant to the question, you MUST \
+include that concrete detail in your answer - do not merely restate the \
+question in different words. A vague answer like "you can do X using Y" is \
+NOT acceptable if the context shows exactly HOW to do it; show the actual \
+code, parameter, or method name from the context instead."""
 
 
 def build_prompt(question: str, retrieved_chunks: list[dict]) -> list[dict]:
