@@ -1,7 +1,79 @@
 <!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>FastAPI Docs RAG</title><style>
-body{margin:0;background:#0b1020;color:#e8edf7;font:16px system-ui,sans-serif}.wrap{max-width:820px;margin:8vh auto;padding:24px}h1{font-size:2.4rem;margin-bottom:8px}.sub{color:#9cabcb}form{display:flex;gap:10px;margin:28px 0}input{flex:1;padding:15px;border-radius:9px;border:1px solid #344264;background:#121a2e;color:inherit;font:inherit}button{padding:0 18px;border:0;border-radius:9px;background:#60a5fa;color:#081326;font-weight:700;cursor:pointer}#answer,#sources{white-space:pre-wrap;line-height:1.6;background:#121a2e;border:1px solid #263452;padding:18px;border-radius:9px;margin-top:16px}.source{font-size:.9rem;color:#b9c7e4;margin:8px 0}small{color:#8ea0c4}</style></head>
-<body><main class="wrap"><h1>FastAPI Docs RAG</h1><p class="sub">Hybrid retrieval · cross-encoder reranking · grounded citations</p><form id="form"><input id="q" required minlength="3" placeholder="How do I add a custom exception handler?"><button>Ask</button></form><small id="status"></small><section id="answer" hidden></section><section id="sources" hidden></section></main><script>
-const f=document.querySelector('#form'),q=document.querySelector('#q'),a=document.querySelector('#answer'),s=document.querySelector('#sources'),status=document.querySelector('#status');
-f.onsubmit=async e=>{e.preventDefault();a.hidden=false;s.hidden=true;a.textContent='';status.textContent='Retrieving and generating…';const r=await fetch('/api/ask',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question:q.value})});const d=await r.json();if(!r.ok){a.textContent=d.detail||'Request failed.';return}a.textContent=d.answer;s.hidden=false;s.innerHTML='<strong>Sources</strong>'+d.sources.map(x=>`<div class="source">[${x.marker}] ${x.header_path} — ${x.source_file}</div>`).join('');status.textContent=`${d.latency_ms} ms${d.cache_hit?' · cached':''}`};
-</script></body></html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>FastAPI Docs RAG</title>
+  <style>
+    :root { color-scheme: dark; --bg: #090d18; --panel: rgba(18, 25, 43, .8); --line: #283451; --text: #f1f5ff; --muted: #98a6c5; --accent: #82b1ff; --accent-ink: #07111f; }
+    * { box-sizing: border-box; }
+    body { min-width: 320px; margin: 0; min-height: 100vh; color: var(--text); font: 16px/1.55 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: radial-gradient(circle at 50% -15%, #1a2d57 0, var(--bg) 42rem); }
+    .shell { width: min(760px, calc(100% - 32px)); margin: 0 auto; padding: 10vh 0 6vh; }
+    .eyebrow { display: inline-flex; align-items: center; gap: .45rem; color: var(--accent); font-size: .78rem; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
+    .dot { width: .48rem; height: .48rem; border-radius: 50%; background: #69e3b2; box-shadow: 0 0 14px #69e3b2; }
+    h1 { margin: .6rem 0 .35rem; font-size: clamp(2rem, 7vw, 3.25rem); letter-spacing: -.055em; line-height: 1.05; }
+    .intro { max-width: 38rem; margin: 0; color: var(--muted); }
+    form { display: flex; gap: .65rem; margin: 2rem 0 .75rem; }
+    input { width: 100%; min-width: 0; padding: .9rem 1rem; border: 1px solid var(--line); border-radius: .75rem; outline: none; color: var(--text); background: rgba(9, 14, 27, .72); font: inherit; transition: border-color .16s, box-shadow .16s; }
+    input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(130, 177, 255, .15); }
+    button { border: 0; border-radius: .75rem; padding: 0 1.1rem; color: var(--accent-ink); background: var(--accent); font: inherit; font-weight: 750; cursor: pointer; transition: transform .16s, opacity .16s; }
+    button:hover { transform: translateY(-1px); } button:disabled { cursor: wait; opacity: .65; transform: none; }
+    #status { display: block; min-height: 1.5rem; color: var(--muted); font-size: .88rem; }
+    .card { margin-top: 1.25rem; padding: 1.25rem; border: 1px solid var(--line); border-radius: 1rem; background: var(--panel); box-shadow: 0 16px 50px rgba(0, 0, 0, .18); }
+    #answer { white-space: pre-wrap; }
+    #sources h2 { margin: 0 0 .75rem; font-size: .9rem; color: var(--muted); text-transform: uppercase; letter-spacing: .07em; }
+    .source { padding: .7rem 0; border-top: 1px solid rgba(152, 166, 197, .16); color: #c9d4ee; font-size: .9rem; }
+    .source strong { color: var(--accent); } .source span { color: var(--muted); }
+    [hidden] { display: none; }
+    @media (max-width: 520px) { .shell { padding-top: 7vh; } form { flex-direction: column; } button { min-height: 3rem; } }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <div class="eyebrow"><span class="dot"></span> FastAPI documentation</div>
+    <h1>Ask the docs.</h1>
+    <p class="intro">Hybrid retrieval with BGE embeddings, BM25 + RRF fusion, and grounded source citations.</p>
+    <form id="form">
+      <input id="question" required minlength="3" autocomplete="off" aria-label="Ask a FastAPI question" placeholder="How do I add a custom exception handler?">
+      <button id="submit" type="submit">Ask</button>
+    </form>
+    <small id="status" role="status" aria-live="polite"></small>
+    <section id="answer" class="card" hidden aria-live="polite"></section>
+    <section id="sources" class="card" hidden>
+      <h2>Retrieved sources</h2><div id="source-list"></div>
+    </section>
+  </main>
+  <script>
+    const form = document.querySelector('#form');
+    const question = document.querySelector('#question');
+    const submit = document.querySelector('#submit');
+    const answer = document.querySelector('#answer');
+    const sources = document.querySelector('#sources');
+    const sourceList = document.querySelector('#source-list');
+    const status = document.querySelector('#status');
+    function renderSources(items) {
+      sourceList.replaceChildren();
+      items.forEach(item => {
+        const row = document.createElement('div'); row.className = 'source';
+        const marker = document.createElement('strong'); marker.textContent = `[${item.marker}] `;
+        const path = document.createTextNode(item.header_path);
+        const file = document.createElement('span'); file.textContent = ` — ${item.source_file}`;
+        row.append(marker, path, file); sourceList.append(row);
+      });
+    }
+    form.addEventListener('submit', async event => {
+      event.preventDefault(); answer.hidden = false; sources.hidden = true; answer.textContent = '';
+      submit.disabled = true; submit.textContent = 'Thinking…';
+      status.textContent = 'Retrieving documentation and drafting a grounded answer…';
+      try {
+        const response = await fetch('/api/ask', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ question: question.value }) });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.detail || 'Request failed.');
+        answer.textContent = data.answer; renderSources(data.sources); sources.hidden = false;
+        status.textContent = `${data.latency_ms} ms${data.cache_hit ? ' · cached response' : ''}`;
+      } catch (error) { answer.textContent = error.message || 'Request failed. Please try again.'; status.textContent = ''; }
+      finally { submit.disabled = false; submit.textContent = 'Ask'; }
+    });
+  </script>
+</body>
+</html>
