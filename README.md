@@ -1,3 +1,15 @@
+---
+title: FastAPI Documentation RAG Assistant
+emoji: "🔎"
+colorFrom: blue
+colorTo: purple
+sdk: docker
+app_port: 7860
+python_version: 3.11
+suggested_hardware: cpu-basic
+short_description: Hybrid RAG over FastAPI documentation with cited answers.
+---
+
 # FastAPI Documentation RAG Assistant
 
 A production-style retrieval-augmented generation application that answers questions strictly from FastAPI's tutorial and advanced documentation. It combines dense semantic search, BM25 keyword retrieval, Reciprocal Rank Fusion, and cross-encoder reranking before generating a cited answer with Groq.
@@ -59,6 +71,22 @@ uvicorn api.main:app --reload
 ```
 
 After the models finish downloading, stop the server and start it normally.
+
+## Deploy to Hugging Face Spaces
+
+This repository is configured as a Docker Space. Create a new Space and select
+**Docker** as its SDK, then push this repository to the Space repository. The
+Docker image pre-downloads the embedding and reranker models during its build,
+and serves the app on port 7860. Add `GROQ_API_KEY` under **Settings → Secrets**
+in the Space; never commit it to the repository.
+
+```powershell
+git remote add space https://huggingface.co/spaces/YOUR_USERNAME/fastapi-docs-rag
+git push space main
+```
+
+The first build is slower because it installs PyTorch and preloads both
+retrieval models. Subsequent app starts load those models from the image cache.
 
 Open `http://127.0.0.1:8000` for the demo UI, or visit `http://127.0.0.1:8000/docs` for interactive API documentation.
 
