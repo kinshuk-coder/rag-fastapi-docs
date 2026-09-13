@@ -40,7 +40,9 @@ from rate_limiter import TokenRateLimiter  # noqa: E402
 
 load_dotenv(os.path.join(PROJECT_ROOT, ".env"))
 
-GROQ_MODEL = "llama-3.1-8b-instant"
+GROQ_MODEL = "openai/gpt-oss-20b"
+
+# updated GROQ_MODEL to openai/gpt-oss-20b as llama-3.3-70b-versatile is decommissioned.
 
 # A SECOND, DIFFERENT model used only for judging (eval/run_eval.py).
 # Confirmed via console.groq.com/settings/limits that Groq enforces TPM

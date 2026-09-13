@@ -49,6 +49,17 @@ The checked-in Chroma index lets you run the app immediately:
 uvicorn api.main:app --reload
 ```
 
+The embedding and reranker models load from the local Hugging Face cache by
+default, so normal starts do not contact Hugging Face. If this is a new
+machine and a model has not yet been cached, download it once with:
+
+```powershell
+$env:HF_LOCAL_FILES_ONLY="false"
+uvicorn api.main:app --reload
+```
+
+After the models finish downloading, stop the server and start it normally.
+
 Open `http://127.0.0.1:8000` for the demo UI, or visit `http://127.0.0.1:8000/docs` for interactive API documentation.
 
 ## API

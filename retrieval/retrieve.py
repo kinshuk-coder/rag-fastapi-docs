@@ -24,6 +24,7 @@ explanation accompanying this file).
 
 import os
 import re
+import time
 import chromadb
 from sentence_transformers import SentenceTransformer, CrossEncoder
 from rank_bm25 import BM25Okapi
@@ -70,6 +71,12 @@ RERANK_CANDIDATE_POOL_SIZE = 15
 # for a candidate pool this size (15 pairs).
 RERANKER_MODEL_NAME = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 
+# The models are downloaded once into Hugging Face's local cache. Loading from
+# that cache prevents startup from issuing a large series of Hub HEAD requests
+# every time the API starts. Set HF_LOCAL_FILES_ONLY=false for a deliberate
+# model refresh or on a machine where the models have not been downloaded yet.
+LOCAL_FILES_ONLY = os.getenv("HF_LOCAL_FILES_ONLY", "true").lower() in {"1", "true", "yes"}
+
 
 def tokenize(text: str) -> list[str]:
     """Simple whitespace/word tokenizer for BM25 - lowercased word tokens."""
@@ -90,7 +97,16 @@ def load_retriever():
     index and chunks.jsonl ever drifted out of sync, we want BM25 to
     reflect what's actually indexed, not what's on disk elsewhere.
     """
-    model = SentenceTransformer(MODEL_NAME)
+    started = time.perf_counter()
+    try:
+        model = SentenceTransformer(MODEL_NAME, local_files_only=LOCAL_FILES_ONLY)
+    except OSError as exc:
+        if LOCAL_FILES_ONLY:
+            raise RuntimeError(
+                "The embedding model is not in the local Hugging Face cache. "
+                "Run once with HF_LOCAL_FILES_ONLY=false to download it, then restart normally."
+            ) from exc
+        raise
     client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
     collection = client.get_collection(COLLECTION_NAME)
 
@@ -109,7 +125,16 @@ def load_retriever():
         "metadatas": metadatas,
     }
 
-    reranker = CrossEncoder(RERANKER_MODEL_NAME)
+    try:
+        reranker = CrossEncoder(RERANKER_MODEL_NAME, local_files_only=LOCAL_FILES_ONLY)
+    except OSError as exc:
+        if LOCAL_FILES_ONLY:
+            raise RuntimeError(
+                "The reranker is not in the local Hugging Face cache. "
+                "Run once with HF_LOCAL_FILES_ONLY=false to download it, then restart normally."
+            ) from exc
+
+    print(f"Loaded retriever in {time.perf_counter() - started:.1f}s (local_files_only={LOCAL_FILES_ONLY})")
 
     return model, collection, bm25_index, reranker
 

@@ -88,7 +88,7 @@ async def lifespan(app: FastAPI):
     api_key = os.getenv("GROQ_API_KEY")
     if not api_key:
         raise RuntimeError("GROQ_API_KEY is required in .env before starting the API")
-    logger.info("Loading retriever components...")
+    logger.info("Loading retriever components from the local Hugging Face cache...")
     app.state.retriever = await asyncio.to_thread(load_retriever)
     app.state.groq_client, app.state.cache = Groq(api_key=api_key), ResponseCache()
     logger.info("RAG API ready")
