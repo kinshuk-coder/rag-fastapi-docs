@@ -88,7 +88,7 @@ async def lifespan(app: FastAPI):
     api_key = os.getenv("GROQ_API_KEY")
     if not api_key:
         raise RuntimeError("GROQ_API_KEY is required in .env before starting the API")
-    logger.info("Loading retriever components from the local Hugging Face cache...")
+    logger.info("Loading low-memory retriever with hosted Hugging Face embeddings...")
     app.state.retriever = await asyncio.to_thread(load_retriever)
     app.state.groq_client, app.state.cache = Groq(api_key=api_key), ResponseCache()
     logger.info("RAG API ready")
@@ -100,8 +100,8 @@ app.add_middleware(CORSMiddleware, allow_origins=os.getenv("CORS_ORIGINS", "http
 
 
 def answer_sync(question: str, top_k: int) -> dict:
-    model, collection, bm25_index, reranker = app.state.retriever
-    chunks = retrieve(question, model, collection, bm25_index, reranker, top_k=top_k)
+    embedding_client, collection, bm25_index = app.state.retriever
+    chunks = retrieve(question, embedding_client, collection, bm25_index, top_k=top_k)
     return {"question": question, "answer": call_groq(app.state.groq_client, build_prompt(question, chunks)), "sources": sources_for(chunks)}
 
 
@@ -139,8 +139,8 @@ async def ask_stream(request: AskRequest) -> StreamingResponse:
     async def events() -> AsyncIterator[str]:
         started = time.perf_counter()
         try:
-            model, collection, bm25_index, reranker = app.state.retriever
-            chunks = await asyncio.to_thread(retrieve, request.question.strip(), model, collection, bm25_index, reranker, request.top_k)
+            embedding_client, collection, bm25_index = app.state.retriever
+            chunks = await asyncio.to_thread(retrieve, request.question.strip(), embedding_client, collection, bm25_index, request.top_k)
             yield f"event: sources\ndata: {json.dumps(sources_for(chunks))}\n\n"
             messages = build_prompt(request.question.strip(), chunks)
             estimated = sum(len(m["content"].split()) for m in messages) * 13 // 10 + 500

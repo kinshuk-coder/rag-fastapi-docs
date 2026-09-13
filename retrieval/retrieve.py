@@ -24,12 +24,16 @@ explanation accompanying this file).
 
 import os
 import re
-import time
+import math
 import chromadb
-from sentence_transformers import SentenceTransformer, CrossEncoder
+from huggingface_hub import InferenceClient
 from rank_bm25 import BM25Okapi
 
-from embed import CHROMA_DB_PATH, COLLECTION_NAME, MODEL_NAME, embed_query
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CHROMA_DB_PATH = os.path.join(PROJECT_ROOT, "data", "chroma_db")
+COLLECTION_NAME = "fastapi_docs"
+MODEL_NAME = "BAAI/bge-small-en-v1.5"
+BGE_QUERY_PREFIX = "Represent this sentence for searching relevant passages: "
 
 # How many candidates each method contributes to the fusion stage,
 # before we cut down to the final top_k. Wider than top_k on purpose -
@@ -56,26 +60,12 @@ DEFAULT_TOP_K = 5
 # it's not sensitive enough to need tuning for a corpus this size.
 RRF_K = 60
 
-# How many chunks the RRF fusion stage hands to the cross-encoder for
-# reranking, BEFORE cutting down to the final DEFAULT_TOP_K. Wider than
-# top_k for the same reason CANDIDATE_POOL_SIZE is wider than top_k:
-# the cross-encoder needs real candidates to choose among, not just the
-# hybrid stage's already-final answer. If this equaled DEFAULT_TOP_K,
-# reranking could only ever reorder the same 5 chunks hybrid search
-# picked - it could never pull in a 6th-or-lower ranked chunk that the
-# cross-encoder judges as actually more relevant.
-RERANK_CANDIDATE_POOL_SIZE = 15
 
-# A standard, well-established cross-encoder for passage reranking -
-# small enough to run on CPU at query time without noticeable latency
-# for a candidate pool this size (15 pairs).
-RERANKER_MODEL_NAME = "cross-encoder/ms-marco-MiniLM-L-6-v2"
-
-# The models are downloaded once into Hugging Face's local cache. Loading from
-# that cache prevents startup from issuing a large series of Hub HEAD requests
-# every time the API starts. Set HF_LOCAL_FILES_ONLY=false for a deliberate
-# model refresh or on a machine where the models have not been downloaded yet.
-LOCAL_FILES_ONLY = os.getenv("HF_LOCAL_FILES_ONLY", "true").lower() in {"1", "true", "yes"}
+# Render's 512 MB instance cannot safely host PyTorch plus two transformer
+# models. Query embeddings are therefore produced by Hugging Face Inference;
+# the precomputed Chroma vectors remain local. This preserves dense + BM25 RRF
+# retrieval while intentionally omitting the former local cross-encoder stage.
+HF_EMBEDDING_MODEL = os.getenv("HF_EMBEDDING_MODEL", MODEL_NAME)
 
 
 def tokenize(text: str) -> list[str]:
@@ -85,28 +75,20 @@ def tokenize(text: str) -> list[str]:
 
 def load_retriever():
     """
-    Loads everything needed for hybrid retrieval + reranking:
-    - the embedding model (for dense search)
+    Loads everything needed for low-memory hybrid retrieval:
+    - a Hugging Face Inference client (for dense query embeddings)
     - the Chroma collection (for dense search)
     - a BM25 index built from the SAME chunks stored in Chroma (for
       keyword search)
-    - a cross-encoder reranker (for precision re-scoring of candidates)
-
     Building the BM25 index from collection.get() rather than re-reading
     chunks.jsonl directly keeps a single source of truth - if Chroma's
     index and chunks.jsonl ever drifted out of sync, we want BM25 to
     reflect what's actually indexed, not what's on disk elsewhere.
     """
-    started = time.perf_counter()
-    try:
-        model = SentenceTransformer(MODEL_NAME, local_files_only=LOCAL_FILES_ONLY)
-    except OSError as exc:
-        if LOCAL_FILES_ONLY:
-            raise RuntimeError(
-                "The embedding model is not in the local Hugging Face cache. "
-                "Run once with HF_LOCAL_FILES_ONLY=false to download it, then restart normally."
-            ) from exc
-        raise
+    hf_token = os.getenv("HF_TOKEN")
+    if not hf_token:
+        raise RuntimeError("HF_TOKEN is required for hosted query embeddings. Add it to your environment secrets.")
+    embedding_client = InferenceClient(provider="hf-inference", api_key=hf_token, timeout=30)
     client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
     collection = client.get_collection(COLLECTION_NAME)
 
@@ -125,23 +107,22 @@ def load_retriever():
         "metadatas": metadatas,
     }
 
-    try:
-        reranker = CrossEncoder(RERANKER_MODEL_NAME, local_files_only=LOCAL_FILES_ONLY)
-    except OSError as exc:
-        if LOCAL_FILES_ONLY:
-            raise RuntimeError(
-                "The reranker is not in the local Hugging Face cache. "
-                "Run once with HF_LOCAL_FILES_ONLY=false to download it, then restart normally."
-            ) from exc
-
-    print(f"Loaded retriever in {time.perf_counter() - started:.1f}s (local_files_only={LOCAL_FILES_ONLY})")
-
-    return model, collection, bm25_index, reranker
+    return embedding_client, collection, bm25_index
 
 
-def dense_search(query: str, model: SentenceTransformer, collection, top_k: int) -> list[dict]:
-    """Same logic as Milestone 3's retrieve(), renamed - now one of two inputs to fusion."""
-    query_embedding = embed_query(model, query)
+def dense_search(query: str, embedding_client: InferenceClient, collection, top_k: int) -> list[dict]:
+    """Hosted query embedding plus local Chroma vector search."""
+    raw_embedding = embedding_client.feature_extraction(BGE_QUERY_PREFIX + query, model=HF_EMBEDDING_MODEL)
+    query_embedding = raw_embedding.tolist()
+    if query_embedding and isinstance(query_embedding[0], list):
+        query_embedding = query_embedding[0]
+    # The existing Chroma corpus was indexed with normalized BGE vectors.
+    # Normalize locally so this works with any compatible HF embedding server,
+    # including servers that do not offer their own normalize parameter.
+    magnitude = math.sqrt(sum(value * value for value in query_embedding))
+    if magnitude == 0:
+        raise RuntimeError("Hugging Face returned a zero-length embedding vector.")
+    query_embedding = [value / magnitude for value in query_embedding]
     results = collection.query(query_embeddings=[query_embedding], n_results=top_k)
 
     ranked = []
@@ -212,57 +193,25 @@ def reciprocal_rank_fusion(
     return results
 
 
-def rerank(query: str, candidates: list[dict], reranker: CrossEncoder, top_k: int) -> list[dict]:
-    """
-    Re-scores each candidate chunk against the query using a cross-
-    encoder (query and chunk text fed TOGETHER into one model, unlike
-    the bi-encoder dense search which embeds them separately). Returns
-    the top_k candidates sorted by this more precise, more expensive
-    score.
-
-    Cross-encoder scores are raw logits, not bounded like cosine
-    similarity or comparable to BM25/fused_score - they're only
-    meaningful relative to each other WITHIN this one call, not across
-    different queries or against the earlier hybrid scores.
-    """
-    if not candidates:
-        return []
-
-    pairs = [(query, c["text"]) for c in candidates]
-    scores = reranker.predict(pairs)
-
-    for candidate, score in zip(candidates, scores):
-        candidate["rerank_score"] = float(score)
-
-    reranked = sorted(candidates, key=lambda c: c["rerank_score"], reverse=True)
-    return reranked[:top_k]
-
-
 def retrieve(
     query: str,
-    model: SentenceTransformer,
+    embedding_client: InferenceClient,
     collection,
     bm25_index: dict,
-    reranker: CrossEncoder,
     top_k: int = DEFAULT_TOP_K,
 ) -> list[dict]:
     """
-    Public retrieval interface: hybrid search (dense + BM25 fused via
-    RRF) narrows the full corpus down to RERANK_CANDIDATE_POOL_SIZE
-    candidates, then the cross-encoder reranks those candidates down to
-    the final top_k. NOTE the added reranker parameter versus
-    Milestone 6's version - see the wiring-changes note for callers.
+    Public retrieval interface: hosted dense query embedding + local BM25,
+    fused with RRF. This deployment-oriented mode does not load PyTorch or a
+    cross-encoder in the web process.
     """
-    dense_results = dense_search(query, model, collection, top_k=CANDIDATE_POOL_SIZE)
+    dense_results = dense_search(query, embedding_client, collection, top_k=CANDIDATE_POOL_SIZE)
     bm25_results = bm25_search(query, bm25_index, top_k=CANDIDATE_POOL_SIZE)
-    fused_candidates = reciprocal_rank_fusion(
-        [dense_results, bm25_results], k=RRF_K, top_k=RERANK_CANDIDATE_POOL_SIZE
-    )
-    return rerank(query, fused_candidates, reranker, top_k=top_k)
+    return reciprocal_rank_fusion([dense_results, bm25_results], k=RRF_K, top_k=top_k)
 
 
 if __name__ == "__main__":
-    model, collection, bm25_index, reranker = load_retriever()
+    embedding_client, collection, bm25_index = load_retriever()
 
     sample_questions = [
         "How do I add a custom exception handler?",
@@ -275,9 +224,9 @@ if __name__ == "__main__":
         print("=" * 80)
         print(f"QUERY: {question}")
         print("-" * 80)
-        results = retrieve(question, model, collection, bm25_index, reranker, top_k=3)
+        results = retrieve(question, embedding_client, collection, bm25_index, top_k=3)
         for rank, r in enumerate(results, start=1):
-            print(f"[{rank}] rerank_score={r['rerank_score']:.4f}  (fused_score={r['fused_score']:.4f})  {r['header_path']}  ({r['chunk_id']})")
+            print(f"[{rank}] fused_score={r['fused_score']:.4f}  {r['header_path']}  ({r['chunk_id']})")
             preview = r["text"][:150].replace("\n", " ")
             print(f"    {preview}...")
         print()

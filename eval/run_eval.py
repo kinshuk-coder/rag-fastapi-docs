@@ -242,7 +242,7 @@ def run_eval():
     if not api_key:
         raise RuntimeError(f"GROQ_API_KEY not found in {os.path.join(PROJECT_ROOT, '.env')}")
     groq_client = Groq(api_key=api_key)
-    embed_model, collection, bm25_index, reranker = load_retriever()
+    embed_model, collection, bm25_index = load_retriever()
 
     eval_set = load_eval_set(EVAL_SET_PATH)
     print(f"Loaded {len(eval_set)} eval questions from {EVAL_SET_PATH}")
@@ -257,7 +257,7 @@ def run_eval():
         hinted_files = parse_hinted_filenames(item.get("expected_source_hint", ""))
 
         t0 = time.time()
-        retrieved_chunks = retrieve(question, embed_model, collection, bm25_index, reranker, top_k=DEFAULT_TOP_K)
+        retrieved_chunks = retrieve(question, embed_model, collection, bm25_index, top_k=DEFAULT_TOP_K)
         t1 = time.time()
 
         messages = build_prompt(question, retrieved_chunks)

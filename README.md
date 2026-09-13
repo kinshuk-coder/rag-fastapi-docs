@@ -1,38 +1,27 @@
----
-title: FastAPI Documentation RAG Assistant
-emoji: "🔎"
-colorFrom: blue
-colorTo: purple
-sdk: docker
-app_port: 7860
-python_version: 3.11
-suggested_hardware: cpu-basic
-short_description: Hybrid RAG over FastAPI documentation with cited answers.
----
-
 # FastAPI Documentation RAG Assistant
 
-A production-style retrieval-augmented generation application that answers questions strictly from FastAPI's tutorial and advanced documentation. It combines dense semantic search, BM25 keyword retrieval, Reciprocal Rank Fusion, and cross-encoder reranking before generating a cited answer with Groq.
+A production-style retrieval-augmented generation application that answers questions strictly from FastAPI's tutorial and advanced documentation. The low-memory deployment uses Hugging Face Inference for query embeddings, then combines local Chroma dense retrieval with BM25 using Reciprocal Rank Fusion before generating a cited answer with Groq.
 
 The project is deliberately evaluation-led: the retrieval and generation choices came from failed eval cases, not from adding components for their own sake.
 
 ## Highlights
 
 - Indexed **85 documentation files into 744 structure-aware chunks**, preserving Markdown headings and code examples.
-- Hybrid retrieval: `bge-small-en-v1.5` dense search + BM25, fused with RRF and reranked with `ms-marco-MiniLM-L-6-v2`.
+- Hybrid retrieval: hosted `bge-small-en-v1.5` query embeddings + local Chroma/BM25, fused with RRF.
 - Grounded generation with numbered source citations and a refusal instruction when the context cannot answer.
 - 27-question evaluation suite covering factual, code lookup, conceptual, ambiguous, and unanswerable questions.
-- FastAPI service with a JSON endpoint, SSE streaming endpoint, startup-time model loading, bounded TTL cache, latency logging, and a minimal browser UI.
+- FastAPI service with JSON and SSE endpoints, bounded TTL cache, latency logging, and a minimal browser UI that fits Render's 512 MB instance.
 
 ## Architecture
 
 ```text
 Question
-  -> dense retrieval (Chroma + BGE) ─┐
-                                    ├-> RRF -> cross-encoder reranker -> top 5 chunks
-  -> keyword retrieval (BM25) ──────┘                                      |
-                                                                           v
-                                    cited grounded prompt -> Groq -> answer + sources
+  -> Hugging Face Inference (BGE query embedding) -> local Chroma --+
+                                                                    +-> RRF -> top 5 chunks
+  -> local keyword retrieval (BM25) --------------------------------+
+                                                                         |
+                                                                         v
+                                           cited grounded prompt -> Groq -> answer + sources
 ```
 
 ## Evaluation results
@@ -41,7 +30,8 @@ The Milestone 7 evaluation run achieved 100% retrieval hit rate, citation validi
 
 ## Run locally
 
-Requirements: Python 3.10+ and a Groq API key.
+Requirements: Python 3.10+, a Groq API key, and a Hugging Face access token
+with **Inference Providers** permission.
 
 ```powershell
 python -m venv venv
@@ -53,6 +43,7 @@ Create `.env` in the repository root:
 
 ```text
 GROQ_API_KEY=your_key_here
+HF_TOKEN=your_hugging_face_token_here
 ```
 
 The checked-in Chroma index lets you run the app immediately:
@@ -61,32 +52,30 @@ The checked-in Chroma index lets you run the app immediately:
 uvicorn api.main:app --reload
 ```
 
-The embedding and reranker models load from the local Hugging Face cache by
-default, so normal starts do not contact Hugging Face. If this is a new
-machine and a model has not yet been cached, download it once with:
+## Deploy to Render (512 MB compatible)
 
-```powershell
-$env:HF_LOCAL_FILES_ONLY="false"
-uvicorn api.main:app --reload
+The production runtime does not install or load PyTorch, sentence-transformers,
+or the cross-encoder. This keeps the app within Render's 512 MB limit; query
+embeddings come from Hugging Face Inference instead.
+
+Create a Render **Web Service** from this repository with:
+
+```text
+Build Command: pip install -r requirements.txt
+Start Command: uvicorn api.main:app --host 0.0.0.0 --port $PORT
 ```
 
-After the models finish downloading, stop the server and start it normally.
+Add these Render environment variables as secrets:
 
-## Deploy to Hugging Face Spaces
-
-This repository is configured as a Docker Space. Create a new Space and select
-**Docker** as its SDK, then push this repository to the Space repository. The
-Docker image pre-downloads the embedding and reranker models during its build,
-and serves the app on port 7860. Add `GROQ_API_KEY` under **Settings → Secrets**
-in the Space; never commit it to the repository.
-
-```powershell
-git remote add space https://huggingface.co/spaces/YOUR_USERNAME/fastapi-docs-rag
-git push space main
+```text
+GROQ_API_KEY=...
+HF_TOKEN=...
 ```
 
-The first build is slower because it installs PyTorch and preloads both
-retrieval models. Subsequent app starts load those models from the image cache.
+Create `HF_TOKEN` from Hugging Face Settings → Access Tokens with the
+**Inference Providers** permission. The free hosted provider can have cold
+starts or quotas, so the API returns a 502 if Hugging Face cannot embed a
+query; retrying is usually sufficient.
 
 Open `http://127.0.0.1:8000` for the demo UI, or visit `http://127.0.0.1:8000/docs` for interactive API documentation.
 
@@ -105,6 +94,7 @@ The response contains `answer`, numbered `sources`, `latency_ms`, and `cache_hit
 ```powershell
 python ingestion/fetch_docs.py
 python ingestion/chunk_docs.py
+pip install -r requirements-local-indexing.txt
 python retrieval/embed.py
 python eval/run_eval.py
 ```
@@ -113,8 +103,8 @@ The evaluation calls Groq and can be limited by your account's rate limits. The 
 
 ## Resume bullet
 
-> Built an evaluation-driven RAG system over 85 FastAPI docs (744 chunks) using BGE embeddings, Chroma, BM25/RRF hybrid retrieval, and cross-encoder reranking; achieved 100% retrieval/citation/refusal accuracy and 4.90/5 faithfulness on a 27-question suite, then shipped it as a streaming FastAPI service with caching and source citations.
+> Built an evaluation-driven RAG system over 85 FastAPI docs (744 chunks) using BGE embeddings, Chroma, and BM25/RRF hybrid retrieval; achieved 100% retrieval/citation/refusal accuracy and 4.90/5 faithfulness on a 27-question suite, then shipped it as a streaming FastAPI service with caching and source citations.
 
 ## Honest limitations and next steps
 
-The system does not yet decompose compound questions into sub-queries, so multi-topic prompts can miss independent concepts. Evaluation uses an LLM judge and should be supplemented with human review for high-stakes quality claims. More detail, including examples of the failures that changed the design, is in [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md).
+The deployed low-memory mode does not run the original cross-encoder reranker, so re-run the evaluation before making quality claims for this configuration. The system also does not yet decompose compound questions into sub-queries, so multi-topic prompts can miss independent concepts. Evaluation uses an LLM judge and should be supplemented with human review for high-stakes quality claims. More detail, including examples of the failures that changed the design, is in [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md).

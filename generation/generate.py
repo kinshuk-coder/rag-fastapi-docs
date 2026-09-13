@@ -201,7 +201,6 @@ def generate_answer(
     embed_model,
     collection,
     bm25_index: dict,
-    reranker,
     groq_client: Groq,
     top_k: int = DEFAULT_TOP_K,
 ) -> dict:
@@ -210,11 +209,9 @@ def generate_answer(
     answer plus the sources actually used, so callers (CLI, eval script)
     can display or check citations without re-deriving them.
 
-    NOTE: as of Milestone 7, retrieve() is hybrid search + cross-encoder
-    reranking, so this now needs a reranker in addition to the
-    embedding model, Chroma collection, and bm25_index.
+    Uses deployment-oriented hybrid RRF retrieval with hosted query embeddings.
     """
-    retrieved_chunks = retrieve(question, embed_model, collection, bm25_index, reranker, top_k=top_k)
+    retrieved_chunks = retrieve(question, embed_model, collection, bm25_index, top_k=top_k)
     messages = build_prompt(question, retrieved_chunks)
     answer_text = call_groq(groq_client, messages)
 
@@ -242,7 +239,7 @@ if __name__ == "__main__":
         )
 
     groq_client = Groq(api_key=api_key)
-    embed_model, collection, bm25_index, reranker = load_retriever()
+    embed_model, collection, bm25_index = load_retriever()
 
     sample_questions = [
         "How do I add a custom exception handler?",
@@ -255,7 +252,7 @@ if __name__ == "__main__":
         print("=" * 80)
         print(f"Q: {question}")
         print("-" * 80)
-        result = generate_answer(question, embed_model, collection, bm25_index, reranker, groq_client)
+        result = generate_answer(question, embed_model, collection, bm25_index, groq_client)
         print(result["answer"])
         print("\nSources:")
         for src in result["sources"]:
