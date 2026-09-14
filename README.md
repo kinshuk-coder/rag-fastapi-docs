@@ -28,17 +28,15 @@ Question
 
 ## Evaluation results
 
-The Milestone 7 evaluation run achieved 100% retrieval hit rate, citation validity, and refusal accuracy, with **4.90/5 faithfulness** on the 27-question set. A manual spot check still caught an incomplete/circular answer that the judge rated highly, which led to an explicit completeness rubric and a stronger generation instruction. See [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md) for the full, candid record.
+The latest 27-question evaluation of the low-memory deployment configuration achieved **95% retrieval hit-rate**, **100% citation validity**, **100% refusal accuracy**, **4.95/5 faithfulness**, **5.00/5 relevance**, and **4.95/5 completeness**. A manual spot check still caught an incomplete/circular answer that the judge rated highly, which led to an explicit completeness rubric and a stronger generation instruction. See [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md) for the full, candid record.
 
 ## Run locally
 
-Requirements: Python 3.10+, a Groq API key, and a Hugging Face access token
+Requirements: [uv](https://docs.astral.sh/uv/), Python 3.12, a Groq API key, and a Hugging Face access token
 with **Inference Providers** permission.
 
 ```powershell
-python -m venv venv
-.\venv\Scripts\Activate.ps1
-pip install -r requirements.txt
+uv sync
 ```
 
 Create `.env` in the repository root:
@@ -51,7 +49,7 @@ HF_TOKEN=your_hugging_face_token_here
 The checked-in Chroma index lets you run the app immediately:
 
 ```powershell
-uvicorn api.main:app --reload
+uv run fastapi dev
 ```
 
 ## Deploy to Render (512 MB compatible)
@@ -63,8 +61,8 @@ embeddings come from Hugging Face Inference instead.
 Create a Render **Web Service** from this repository with:
 
 ```text
-Build Command: pip install -r requirements.txt
-Start Command: uvicorn api.main:app --host 0.0.0.0 --port $PORT
+Build Command: uv sync --frozen --no-dev
+Start Command: uv run uvicorn api.main:app --host 0.0.0.0 --port $PORT
 ```
 
 Add these Render environment variables as secrets:
@@ -96,17 +94,28 @@ The response contains `answer`, numbered `sources`, `latency_ms`, and `cache_hit
 ```powershell
 python ingestion/fetch_docs.py
 python ingestion/chunk_docs.py
-pip install -r requirements-local-indexing.txt
-python retrieval/embed.py
-python eval/run_eval.py
+uv sync --group indexing
+uv run python retrieval/embed.py
+uv run python eval/run_eval.py
 ```
 
 The evaluation calls Groq and can be limited by your account's rate limits. The client-side token limiter handles per-model TPM pacing; inspect `eval/eval_results.jsonl` after a run for judge parse errors or per-question failures.
 
 ## Resume bullet
 
-> Built an evaluation-driven RAG system over 85 FastAPI docs (744 chunks) using BGE embeddings, Chroma, and BM25/RRF hybrid retrieval; achieved 100% retrieval/citation/refusal accuracy and 4.90/5 faithfulness on a 27-question suite, then shipped it as a streaming FastAPI service with caching and source citations.
+> Built an evaluation-driven RAG system over 85 FastAPI docs (744 chunks) using BGE embeddings, Chroma, and BM25/RRF hybrid retrieval; achieved 95% retrieval hit-rate, 100% citation/refusal accuracy, and 4.95/5 faithfulness on a 27-question suite, then shipped it as a streaming FastAPI service with caching and source citations.
 
 ## Honest limitations and next steps
 
 The deployed low-memory mode does not run the original cross-encoder reranker, so re-run the evaluation before making quality claims for this configuration. The system also does not yet decompose compound questions into sub-queries, so multi-topic prompts can miss independent concepts. Evaluation uses an LLM judge and should be supplemented with human review for high-stakes quality claims. More detail, including examples of the failures that changed the design, is in [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md).
+
+## Deploy to FastAPI Cloud
+
+FastAPI Cloud supports this project's `pyproject.toml` and `uv.lock` directly.
+Set `GROQ_API_KEY` and `HF_TOKEN` as cloud environment secrets, then run:
+
+```powershell
+uv run fastapi deploy
+```
+
+The explicit `api.main:app` entrypoint is configured in `pyproject.toml`.

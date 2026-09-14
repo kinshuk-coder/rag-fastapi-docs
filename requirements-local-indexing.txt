@@ -1,5 +1,0 @@
-# Needed only to rebuild data/chroma_db with retrieval/embed.py.
-# Do not use this file on Render's 512 MB web service.
--r requirements.txt
-sentence-transformers
-gitpython
