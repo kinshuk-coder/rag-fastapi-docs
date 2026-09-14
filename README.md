@@ -2,6 +2,8 @@
 
 A production-style retrieval-augmented generation application that answers questions strictly from FastAPI's tutorial and advanced documentation. The low-memory deployment uses Hugging Face Inference for query embeddings, then combines local Chroma dense retrieval with BM25 using Reciprocal Rank Fusion before generating a cited answer with Groq.
 
+**Live demo:** [rag-fastapi-docs-w2zp.onrender.com](https://rag-fastapi-docs-w2zp.onrender.com)
+
 The project is deliberately evaluation-led: the retrieval and generation choices came from failed eval cases, not from adding components for their own sake.
 
 ## Highlights
